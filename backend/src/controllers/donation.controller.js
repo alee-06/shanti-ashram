@@ -1,0 +1,539 @@
+const Donation = require("../models/Donation");
+const razorpay = require("../config/razorpay");
+const { v4: uuidv4 } = require("uuid");
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
+const User = require("../models/User");
+const {
+  generateDonationReceipt,
+  getReceiptPublicUrl,
+} = require("../services/receipt.service");
+const { sendDonationReceiptEmail } = require("../services/email.service");
+const {
+  resolveCollector,
+  getTopCollectors,
+  getCollectorStats,
+  validateReferralCode,
+} = require("../services/collector.service");
+const { logDonationAttribution } = require("../services/audit.service");
+
+/**
+ * Helper: Validate PAN number
+ */
+const validateGovtId = (idType, idNumber) => {
+  const panRegex = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
+
+  if (idType !== "PAN") {
+    return { valid: false, message: "Only PAN is accepted" };
+  }
+
+  if (!panRegex.test(idNumber)) {
+    return { valid: false, message: "Invalid PAN number format" };
+  }
+
+  return { valid: true };
+};
+
+/**
+ * Helper: Validate age (must be 18+)
+ */
+const validateAge = (dob) => {
+  const birthDate = new Date(dob);
+  if (isNaN(birthDate.getTime())) {
+    return { valid: false, message: "Invalid date of birth" };
+  }
+
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+  const m = today.getMonth() - birthDate.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) age--;
+
+  if (age < 18) {
+    return { valid: false, message: "Donor must be 18 years or older" };
+  }
+
+  return { valid: true };
+};
+
+/**
+ * Create donation record
+ * POST /donations/create
+ * Accepts full donor object and stores snapshot
+ * Optional referralCode for collector attribution
+ */
+exports.createDonation = async (req, res) => {
+  try {
+    // FIX 1: Removed otpVerified from destructuring - never trust client input
+    const { donor, donationHead, amount, referralCode } = req.body;
+
+    // Validate required fields
+    if (!donor || !donationHead || !amount || amount <= 0) {
+      return res.status(400).json({ message: "Invalid donation data" });
+    }
+
+    // Production hardening: Donation amount limits
+    const MIN_DONATION = 10; // ₹10 minimum
+    const MAX_DONATION = 10000000; // ₹1 crore maximum
+    const numericAmount = Number(amount);
+
+    if (!Number.isFinite(numericAmount) || numericAmount < MIN_DONATION) {
+      return res
+        .status(400)
+        .json({ message: `Minimum donation amount is ₹${MIN_DONATION}` });
+    }
+    if (numericAmount > MAX_DONATION) {
+      return res
+        .status(400)
+        .json({
+          message: `Maximum donation amount is ₹${MAX_DONATION.toLocaleString("en-IN")}`,
+        });
+    }
+
+    // Validate donor object
+    const {
+      name,
+      mobile,
+      email,
+      emailOptIn,
+      emailVerified,
+      address,
+      addressObj,
+      anonymousDisplay,
+      dob,
+      idType,
+      idNumber,
+    } = donor;
+
+    // Address can come as legacy string OR structured addressObj
+    const hasAddress =
+      address || (addressObj && (addressObj.line || addressObj.city));
+    if (!name || !mobile || !hasAddress || !dob || !idType || !idNumber) {
+      return res
+        .status(400)
+        .json({ message: "Missing required donor details" });
+    }
+
+    // Build structured address if provided by new frontend
+    const structuredAddress = addressObj
+      ? {
+          line: addressObj.line || "",
+          city: addressObj.city || "",
+          state: addressObj.state || "",
+          country: addressObj.country || "India",
+          pincode: addressObj.pincode || "",
+        }
+      : undefined;
+
+    // Build legacy address string for backward compatibility
+    const legacyAddress =
+      address ||
+      (structuredAddress
+        ? [
+            structuredAddress.line,
+            structuredAddress.city,
+            structuredAddress.state,
+            structuredAddress.country,
+            structuredAddress.pincode,
+          ]
+            .filter(Boolean)
+            .join(", ")
+        : "");
+
+    // Validate donationHead object - must have valid id and name (not empty, not "null" string)
+    if (
+      !donationHead ||
+      !donationHead.id ||
+      !donationHead.name ||
+      donationHead.id === "null" ||
+      donationHead.name === "null" ||
+      donationHead.id.trim() === "" ||
+      donationHead.name.trim() === ""
+    ) {
+      return res
+        .status(400)
+        .json({ message: "Please select a valid donation cause" });
+    }
+
+    // Validate government ID
+    const idValidation = validateGovtId(idType, idNumber);
+    if (!idValidation.valid) {
+      return res.status(400).json({ message: idValidation.message });
+    }
+
+    // Validate age
+    const ageValidation = validateAge(dob);
+    if (!ageValidation.valid) {
+      return res.status(400).json({ message: ageValidation.message });
+    }
+
+    // Validate referral code if provided - REJECT on invalid
+    let collector = null;
+    let hasCollectorAttribution = false;
+
+    if (referralCode && referralCode.trim()) {
+      const validation = await validateReferralCode(referralCode);
+      if (!validation.valid) {
+        return res.status(400).json({
+          message: validation.error || "Invalid referral code",
+        });
+      }
+      collector = {
+        collectorId: validation.collectorId,
+        collectorName: validation.collectorName,
+      };
+      hasCollectorAttribution = true;
+    }
+
+    // Create donation with donor snapshot
+
+    const donation = await Donation.create({
+      user: req.user?.id || null,
+      // Collector attribution (nullable - only set when valid referral code provided)
+      collectorId: collector?.collectorId || null,
+      collectorName: collector?.collectorName || null,
+      hasCollectorAttribution,
+      donor: {
+        name,
+        mobile,
+        email: email || undefined,
+        emailOptIn: emailOptIn || false,
+        emailVerified: emailVerified || false,
+        address: legacyAddress,
+        addressObj: structuredAddress || undefined,
+        anonymousDisplay: anonymousDisplay || false,
+        dob: new Date(dob),
+        idType,
+        idNumber,
+      },
+      donationHead: {
+        id: donationHead.id,
+        name: donationHead.name,
+      },
+      amount,
+      paymentMethod: "ONLINE",
+      // FIX 1: Always false - only set true server-side after OTP verification
+      otpVerified: false,
+      status: "PENDING",
+    });
+
+    // Audit log: Donation attributed to collector
+    if (hasCollectorAttribution && collector) {
+      logDonationAttribution(
+        donation._id,
+        collector.collectorId,
+        collector.collectorName,
+        amount,
+      );
+    }
+
+    res.status(201).json({
+      message: "Donation initiated",
+      donationId: donation._id,
+      status: donation.status,
+    });
+  } catch (error) {
+    console.error("Create donation error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+exports.createDonationOrder = async (req, res) => {
+  try {
+    const { donationId } = req.body;
+
+    if (!donationId) {
+      return res.status(400).json({ message: "Donation ID required" });
+    }
+
+    const donation = await Donation.findById(donationId);
+
+    if (!donation) {
+      return res.status(404).json({ message: "Donation not found" });
+    }
+
+    const options = {
+      amount: donation.amount * 100,
+      currency: "INR",
+      receipt: donation._id.toString().slice(-12),
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    donation.razorpayOrderId = order.id;
+    await donation.save();
+
+    res.json({
+      razorpayOrderId: order.id,
+      amount: options.amount, // Return amount in paise for Razorpay
+      currency: "INR",
+      key: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Failed to create Razorpay order" });
+  }
+};
+
+/**
+ * ❌ REMOVED: verifyPayment
+ *
+ * Payment verification is now handled EXCLUSIVELY by Razorpay webhook.
+ * Frontend should NOT call any backend endpoint to confirm payment.
+ * After Razorpay checkout completes, frontend should:
+ *   1. Navigate to Step5Success page
+ *   2. Poll GET /donations/:id/status
+ *   3. Wait for webhook to update status to SUCCESS or FAILED
+ *
+ * If webhook is down, donation MUST remain PENDING forever.
+ * This is by design - we NEVER trust frontend payment callbacks.
+ */
+
+/**
+ * Get user's donations (JWT protected)
+ * GET /user/donations
+ */
+exports.getUserDonations = async (req, res) => {
+  try {
+    const donations = await Donation.find({ user: req.user.id })
+      .select(
+        "_id donationHead donor amount status createdAt receiptUrl receiptNumber",
+      )
+      .sort({ createdAt: -1 });
+
+    // Format response with display name handling
+    const formattedDonations = donations.map((d) => {
+      const donorObj = d.donor.toObject ? d.donor.toObject() : d.donor;
+      return {
+        _id: d._id,
+        donationHead: d.donationHead,
+        donorName: donorObj.anonymousDisplay ? "Anonymous" : donorObj.name,
+        donor: donorObj,
+        amount: d.amount,
+        status: d.status,
+        createdAt: d.createdAt,
+        receiptUrl: d.receiptUrl,
+        receiptNumber: d.receiptNumber,
+      };
+    });
+
+    res.json(formattedDonations);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch donations" });
+  }
+};
+
+/**
+ * Get donation status
+ * PUBLIC endpoint - no auth required
+ * Used by Step5Success polling for both guest and logged-in users
+ * Safe: only returns status, no sensitive data
+ */
+exports.getDonationStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate ObjectId format to prevent DB errors
+    if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({ message: "Invalid donation ID" });
+    }
+
+    const donation = await Donation.findById(id).select(
+      "status donationHead amount receiptNumber",
+    );
+
+    if (!donation) {
+      return res.status(404).json({ status: "NOT_FOUND" });
+    }
+
+    res.json({
+      status: donation.status,
+      donationHead: donation.donationHead,
+      amount: donation.amount,
+      receiptNumber: donation.receiptNumber,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch donation status" });
+  }
+};
+
+/**
+ * Download donation receipt
+ * PUBLIC endpoint - accessible via donationId (acts as access token)
+ * ALWAYS regenerates the PDF using the current template so that
+ * both "just after payment" and "My Donations" downloads are identical.
+ * Only returns receipt if donation.status === "SUCCESS"
+ */
+exports.downloadReceipt = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate ObjectId format
+    if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({ message: "Invalid donation ID" });
+    }
+
+    const donation = await Donation.findById(id);
+
+    if (!donation) {
+      return res.status(404).json({ message: "Donation not found" });
+    }
+
+    // Check if donation is successful
+    if (donation.status !== "SUCCESS") {
+      return res
+        .status(403)
+        .json({ message: "Receipt not available for this donation" });
+    }
+
+    // Ensure donation has a receipt number before generating
+    if (!donation.receiptNumber) {
+      donation.receiptNumber = `GRD-${new Date(donation.createdAt).getFullYear()}-${donation._id.toString().slice(-6).toUpperCase()}`;
+    }
+
+    // Always regenerate the PDF so that every download uses the current
+    // template (prevents stale cached files with outdated layout).
+    const generatedPath = await generateDonationReceipt(donation);
+
+    if (!generatedPath || !fs.existsSync(generatedPath)) {
+      return res.status(500).json({ message: "Failed to generate receipt" });
+    }
+
+    // Persist receiptUrl if it was missing or has changed
+    const publicUrl = getReceiptPublicUrl(generatedPath);
+    if (donation.receiptUrl !== publicUrl) {
+      donation.receiptUrl = publicUrl;
+      await donation.save();
+    }
+
+    // Stream the freshly-generated PDF
+    const filename = `receipt-${donation.receiptNumber || donation._id}.pdf`;
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    const fileStream = fs.createReadStream(generatedPath);
+    fileStream.pipe(res);
+  } catch (err) {
+    console.error("Receipt download error:", err);
+    res.status(500).json({ message: "Failed to download receipt" });
+  }
+};
+
+/**
+ * Get last donor profile for authenticated user
+ * GET /donations/me/last-profile
+ *
+ * Returns safe donor fields from the latest successful donation
+ * so the frontend can auto-fill the donation form for returning donors.
+ *
+ * Security:
+ * - Requires authentication (JWT)
+ * - Never returns payment details, amount, referral, or internal IDs
+ * - Only returns donor snapshot fields
+ *
+ * Backward compatibility:
+ * - Supports both structured addressObj and legacy address string
+ * - Returns 404 with empty body if no past donation (frontend fails silently)
+ */
+exports.getLastDonorProfile = async (req, res) => {
+  try {
+    if (!req.user?.id) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
+
+    // Find latest successful donation by this user
+    // Uses compound index: { user: 1, status: 1, createdAt: -1 }
+    const donation = await Donation.findOne(
+      { user: req.user.id, status: "SUCCESS" },
+      {
+        // Project only the safe donor fields we need
+        "donor.name": 1,
+        "donor.mobile": 1,
+        "donor.email": 1,
+        "donor.address": 1,
+        "donor.addressObj": 1,
+        "donor.dob": 1,
+        "donor.idNumber": 1,
+        _id: 0,
+      },
+    )
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!donation) {
+      return res.status(404).json({ message: "No past donation found" });
+    }
+
+    const { donor } = donation;
+
+    // Build safe response payload
+    const profile = {
+      fullName: donor.name || "",
+      mobile: donor.mobile || "",
+      email: donor.email || "",
+      panNumber: donor.idNumber || "",
+      dob: donor.dob || null,
+    };
+
+    // Include structured address if available
+    if (donor.addressObj && (donor.addressObj.line || donor.addressObj.city)) {
+      profile.addressObj = {
+        line: donor.addressObj.line || "",
+        city: donor.addressObj.city || "",
+        state: donor.addressObj.state || "",
+        country: donor.addressObj.country || "India",
+        pincode: donor.addressObj.pincode || "",
+      };
+    }
+
+    // Include legacy address string for backward compatibility
+    if (donor.address) {
+      profile.address = donor.address;
+    }
+
+    res.json(profile);
+  } catch (error) {
+    console.error("Get last donor profile error:", error);
+    res.status(500).json({ message: "Failed to fetch donor profile" });
+  }
+};
+
+/**
+ * Get top collectors leaderboard
+ * GET /donations/leaderboard
+ * Returns top 5 collectors ranked by total donation amount
+ */
+exports.getLeaderboard = async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 5, 20); // Cap at 20
+    const leaderboard = await getTopCollectors(limit);
+    res.json({ leaderboard });
+  } catch (error) {
+    console.error("Leaderboard error:", error);
+    res.status(500).json({ message: "Failed to fetch leaderboard" });
+  }
+};
+
+/**
+ * Get current user's collector stats
+ * GET /donations/my-collector-stats
+ * Requires authentication
+ */
+exports.getMyCollectorStats = async (req, res) => {
+  try {
+    if (!req.user?.id) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
+
+    const stats = await getCollectorStats(req.user.id);
+    if (!stats) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json(stats);
+  } catch (error) {
+    console.error("Collector stats error:", error);
+    res.status(500).json({ message: "Failed to fetch collector stats" });
+  }
+};
